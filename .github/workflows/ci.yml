@@ -1,0 +1,50 @@
+name: CI
+# ref: https://github.com/sigoden/dufs/blob/main/.github/workflows/ci.yaml
+on:
+  pull_request:
+    branches:
+      - "*"
+  push:
+    branches:
+      - master
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  all:
+    name: All
+
+    strategy:
+      matrix:
+        os:
+          - ubuntu-latest
+          # - macos-latest
+          # - windows-latest
+
+    runs-on: ${{matrix.os}}
+
+    env:
+      RUSTFLAGS: --deny warnings
+
+    steps:
+      - uses: actions/checkout@v2
+
+      - name: Install Rust Toolchain Components
+        uses: actions-rs/toolchain@v1
+        with:
+          components: clippy, rustfmt
+          override: true
+          toolchain: stable
+
+      - uses: Swatinem/rust-cache@v1
+
+      - name: Test
+        run: cargo test --all
+
+      - name: Clippy
+        run: cargo clippy --all --all-targets
+
+      - name: Format
+        run: cargo fmt --all --check
