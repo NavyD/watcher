@@ -1,0 +1,16 @@
+[package]
+name = "watcher"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.67" # std::sync::mpsc implementation updated based on crossbeam-channel. 
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+anyhow = "1.0"
+clap = { version = "4.1", features = ["derive"] }
+env_logger = "0.10"
+humantime = "2.1"
+log = "0.4"
+notify = { version = "5.1", default-features = false }
+shlex = "1.1"
+strum = { version = "0.24", features = ["derive"] }
