@@ -1,5 +1,5 @@
 use std::{
-    io::Write,
+    io::{self, Write},
     path::PathBuf,
     process::{exit, Child, Command, Stdio},
     sync::{
@@ -11,37 +11,49 @@ use std::{
 
 use anyhow::{anyhow, bail, Result};
 use clap::{Parser, ValueEnum};
+use fake_tty::make_script_command;
+use itertools::Itertools;
 use log::{debug, info, trace, warn};
 use notify::{Event, RecommendedWatcher, RecursiveMode, Watcher};
 use strum::{Display, EnumString};
+
+fn main() {
+    if let Err(e) = Cli::new().and_then(|cli| cli.start()) {
+        eprintln!("failed to run cli: {e}");
+        exit(1)
+    }
+}
 
 /// Simple program to greet a person  
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
 struct Args {
-    #[arg(short, long, action = clap::ArgAction::Count, default_value_t = 1)]
+    /// log level. default off
+    #[arg(short, long, action = clap::ArgAction::Count, default_value_t = 0)]
     verbose: u8,
 
+    /// recursive for paths
     #[arg(short, long, default_value_t = false)]
     recurive: bool,
 
+    /// Timeout for rechecking monitoring events
     #[arg(short = 'i', long, default_value = "30s")]
     poll_interval: humantime::Duration,
 
+    /// Run a command in sh, pretending to be a tty. useful for example: docker exec
+    #[arg(short, long, default_value_t = false)]
+    tty: bool,
+
+    /// run a command and send event to the stdin
     #[arg(short, long)]
     command: Option<String>,
 
-    // /// 指定该选项可以在命令执行错误的情况下重新执行，而不是终止当前程序
-    // #[arg(long, default_value_t = false)]
-    // ignore_command_failed: bool,
-
     // #[arg(short, long)]
     // format: Option<String>,
-
-    #[arg(short, long)]
+    #[arg(short, long, value_delimiter = ',')]
     events: Option<Vec<EventType>>,
 
-    /// 选择需要监控的路径
+    /// the monitoring paths. default cur path if empty
     paths: Vec<PathBuf>,
 }
 
@@ -149,6 +161,13 @@ impl Cli {
         })
     }
 
+    fn format(&self, e: &EventInfo, writer: &mut impl Write) -> Result<()> {
+        // TODO: format
+        let path_str = e.paths.iter().filter_map(|p| p.to_str()).join(",");
+        writeln!(writer, "{} {}", e.event, path_str)?;
+        Ok(())
+    }
+
     fn start(&self) -> Result<()> {
         // start watch paths
         let mut watcher = self.watcher.lock().map_err(|e| anyhow!("{e}"))?;
@@ -162,25 +181,25 @@ impl Cli {
             watcher.watch(path, rec_mod)?;
         }
 
+        let timeout: Duration = self.args.poll_interval.into();
         let interested_events = self.args.events.as_ref();
-        info!(
-            "waiting {} events in {} {} paths: {:?}",
+        println!(
+            "waiting {} events in interval {}s for {}paths: {:?}",
             if let Some(es) = interested_events {
                 format!("{es:?}")
             } else {
                 "all".to_string()
             },
-            if self.args.recurive { "recurive" } else { "" },
-            paths.len(),
+            timeout.as_secs(),
+            if self.args.recurive { "recurive " } else { "" },
             paths
         );
-        let timeout: Duration = self.args.poll_interval.into();
 
         let mut cur_child = None::<Child>;
         let mut last_info = None::<EventInfo>;
         loop {
             trace!(
-                "waiting timeout {} for next info. last info: {last_info:?}",
+                "waiting timeout {}s for last info: {last_info:?}",
                 timeout.as_secs()
             );
             match self.rx.recv_timeout(timeout) {
@@ -189,19 +208,18 @@ impl Cli {
                         .filter(|es| es.iter().all(|e| *e != info.event))
                         .is_some()
                     {
-                        debug!("skipped received event {info:?}");
+                        trace!("skipped received event {info:?}");
                         continue;
                     }
 
-                    // 已存在的进程发送stdin 或 已终止时重启任务 或 重新计数任务
-
+                    info!("found new event {} in path {:?}", info.event, info.paths);
                     if let Some(_cmd) = self.args.command.as_deref() {
                         if let Some(child) = cur_child.as_mut() {
                             // check child still live?
                             if let Some(status) = child.try_wait()? {
                                 // terminated
-                                info!(
-                                    "Executing command again for exited status {:?} command process {}",
+                                trace!(
+                                    "cleaning exited status {:?} for process {}",
                                     status.code(),
                                     child.id()
                                 );
@@ -210,25 +228,19 @@ impl Cli {
                                 cur_child.take();
                             } else {
                                 // alive
-                                debug!(
-                                    "found running process {} for recv timeout {}",
-                                    child.id(),
-                                    timeout.as_secs()
-                                );
+                                trace!("Writing info `{info:?}` to be formatted to the stdin of existing process {}", child.id());
+                                // dont close stdin, only release lock to unblock
+                                self.format(&info, child.stdin.as_mut().unwrap())?;
 
-                                // input to proc stdin
-                                {
-                                    let line = format!("{info:?}");
-                                    let stdin = child.stdin.as_mut().unwrap();
-                                    writeln!(stdin, "{line}")?;
-                                    // dont close stdin, only release lock to unblock
-                                }
                                 last_info = None;
                                 continue;
                             }
                         }
 
                         last_info = Some(info);
+                    } else {
+                        trace!("Writing info `{info:?}` to be formatted to the stdout");
+                        self.format(&info, &mut io::stdout())?;
                     }
                 }
                 Err(RecvTimeoutError::Timeout) => {
@@ -255,17 +267,13 @@ impl Cli {
                                 };
                                 child
                             } else {
-                                info!("starting new process `{cmd}` by info: {info:?}");
+                                info!("starting new process `{cmd}`");
                                 self.spawn(cmd)?
                             };
 
                             // input to proc stdin
-                            {
-                                let line = format!("{info:?}");
-                                let stdin = child.stdin.as_mut().unwrap();
-                                writeln!(stdin, "{line}")?;
-                                // dont close stdin, only release lock to unblock
-                            }
+                            trace!("Writing info `{info:?}` to be formatted to the stdin of process {}", child.id());
+                            self.format(&info, child.stdin.as_mut().unwrap())?;
 
                             cur_child = Some(child);
                         }
@@ -279,24 +287,23 @@ impl Cli {
     }
 
     fn spawn(&self, cmd: &str) -> Result<Child> {
-        let args =
-            shlex::split(cmd).ok_or_else(|| anyhow!("Unable to parse the command: {cmd}"))?;
+        if self.args.tty {
+            let sh = "sh";
+            trace!("executing command `{cmd}` in tty {sh}");
+            make_script_command(cmd, Some(sh)).and_then(|mut c| c.stdin(Stdio::piped()).spawn())
+        } else {
+            let args =
+                shlex::split(cmd).ok_or_else(|| anyhow!("Unable to parse the command: {cmd}"))?;
 
-        debug!("executing command with args: {args:?}");
-        let name = &args[0];
-        Command::new(name)
-            .args(&args[1..])
-            .stdin(Stdio::piped())
-            // .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .map_err(Into::into)
-    }
-}
-
-fn main() {
-    if let Err(e) = Cli::new().and_then(|cli| cli.start()) {
-        eprintln!("failed to run cli: {e}");
-        exit(1)
+            trace!("executing command `{cmd}` with args: {args:?}");
+            let name = &args[0];
+            Command::new(name)
+                .args(&args[1..])
+                .stdin(Stdio::piped())
+                // .stdout(Stdio::piped())
+                // .stderr(Stdio::piped())
+                .spawn()
+        }
+        .map_err(Into::into)
     }
 }
