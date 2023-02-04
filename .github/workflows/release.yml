@@ -152,7 +152,7 @@ jobs:
           files: ${{ steps.package.outputs.archive }}
           prerelease: ${{ steps.check-tag.outputs.rc == 'true' }}
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.token }}
 
   # docker:
   #   name: Publish to Docker Hub
