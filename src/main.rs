@@ -1,23 +1,19 @@
 use std::{
-    fmt::format,
-    io::{self, Read, Write},
+    io::Write,
     path::PathBuf,
     process::{exit, Child, Command, Stdio},
     sync::{
-        atomic::AtomicBool,
-        mpsc::{channel, sync_channel, Receiver, RecvTimeoutError},
+        mpsc::{sync_channel, Receiver, RecvTimeoutError},
         Arc, Mutex,
     },
-    thread::{self, JoinHandle},
-    time::{Duration, Instant},
+    time::Duration,
 };
 
 use anyhow::{anyhow, bail, Result};
 use clap::{Parser, ValueEnum};
-use log::{debug, error, info, trace, warn};
+use log::{debug, info, trace, warn};
 use notify::{Event, RecommendedWatcher, RecursiveMode, Watcher};
 use strum::{Display, EnumString};
-use threadpool::ThreadPool;
 
 /// Simple program to greet a person  
 #[derive(Parser, Debug)]
@@ -29,21 +25,18 @@ struct Args {
     #[arg(short, long, default_value_t = false)]
     recurive: bool,
 
-    #[arg(short = 'i', long, default_value = "10s")]
+    #[arg(short = 'i', long, default_value = "30s")]
     poll_interval: humantime::Duration,
 
     #[arg(short, long)]
     command: Option<String>,
 
-    #[arg(short = 'm', long, default_value_t = CmdRunMode::Single)]
-    cmd_run_mode: CmdRunMode,
+    // /// 指定该选项可以在命令执行错误的情况下重新执行，而不是终止当前程序
+    // #[arg(long, default_value_t = false)]
+    // ignore_command_failed: bool,
 
-    /// 指定该选项可以在命令执行错误的情况下重新执行，而不是终止当前程序
-    #[arg(long, default_value_t = false)]
-    ignore_command_failed: bool,
-
-    #[arg(short, long)]
-    format: Option<String>,
+    // #[arg(short, long)]
+    // format: Option<String>,
 
     #[arg(short, long)]
     events: Option<Vec<EventType>>,
@@ -65,18 +58,6 @@ impl Args {
             .init();
         Ok(())
     }
-}
-
-// 阻塞，单例，并发
-#[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, ValueEnum, EnumString, Display)]
-#[strum(serialize_all = "kebab-case")]
-enum CmdRunMode {
-    /// 单线程执行命令
-    Block,
-    /// 在命令执行期间仅执行一次，同时将事件不停的传入stdin。需要命令实时读取
-    Single,
-    /// 一个事件运行一次命令
-    Concurrent,
 }
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, ValueEnum, EnumString, Display)]
@@ -103,12 +84,6 @@ struct EventInfo {
     paths: Vec<PathBuf>,
 }
 
-// #[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, ValueEnum)]
-// enum FormatMode {
-//     Text,
-//     Json,
-// }
-
 struct Cli {
     args: Args,
     watcher: Arc<Mutex<RecommendedWatcher>>,
@@ -117,10 +92,12 @@ struct Cli {
 
 impl Cli {
     pub fn new() -> Result<Self> {
-        let args = Args::parse();
+        let mut args = Args::parse();
         args.init_log()?;
+
         if args.paths.is_empty() {
-            bail!("empty paths");
+            info!("use current path . by default");
+            args.paths.push(".".into());
         }
 
         let channel_size = 1000;
@@ -150,8 +127,8 @@ impl Cli {
                         event: event_type,
                         paths: e.paths,
                     };
-                    use std::sync::mpsc::{SendError, TrySendError};
 
+                    use std::sync::mpsc::{SendError, TrySendError};
                     tx.try_send(info).or_else(|e| match e {
                         TrySendError::Full(info) => {
                             // 在事件b到达时被通道阻塞，正在重试并等待通道可用
@@ -173,6 +150,7 @@ impl Cli {
     }
 
     fn start(&self) -> Result<()> {
+        // start watch paths
         let mut watcher = self.watcher.lock().map_err(|e| anyhow!("{e}"))?;
         let rec_mod = if self.args.recurive {
             RecursiveMode::Recursive
@@ -181,7 +159,6 @@ impl Cli {
         };
         let paths = &self.args.paths;
         for path in paths {
-            trace!("watching {}", path.display());
             watcher.watch(path, rec_mod)?;
         }
 
@@ -197,7 +174,6 @@ impl Cli {
             paths.len(),
             paths
         );
-
         let timeout: Duration = self.args.poll_interval.into();
 
         let mut cur_child = None::<Child>;
@@ -303,13 +279,12 @@ impl Cli {
     }
 
     fn spawn(&self, cmd: &str) -> Result<Child> {
-        trace!("parsing command: {cmd}");
         let args =
             shlex::split(cmd).ok_or_else(|| anyhow!("Unable to parse the command: {cmd}"))?;
 
-        debug!("executing command as args: {args:?}");
-        let name = args[0].to_string();
-        Command::new(&name)
+        debug!("executing command with args: {args:?}");
+        let name = &args[0];
+        Command::new(name)
             .args(&args[1..])
             .stdin(Stdio::piped())
             // .stdout(Stdio::piped())
