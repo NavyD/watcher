@@ -12,10 +12,11 @@ use std::{
 use anyhow::{anyhow, bail, Result};
 use clap::{Parser, ValueEnum};
 use fake_tty::make_script_command;
+use glob::{MatchOptions, Pattern};
 use itertools::Itertools;
 use log::{debug, info, trace, warn};
 use notify::{Event, RecommendedWatcher, RecursiveMode, Watcher};
-use strum::{Display, EnumString};
+use strum::{Display, EnumIter, EnumString, IntoEnumIterator};
 
 fn main() {
     if let Err(e) = Cli::new().and_then(|cli| cli.start()) {
@@ -24,9 +25,9 @@ fn main() {
     }
 }
 
-/// Simple program to greet a person  
+/// A simple project to monitor file events and run commands
 #[derive(Parser, Debug)]
-#[command(author, version, about, long_about = None)]
+#[command(author, version)]
 struct Args {
     /// log level. default off
     #[arg(short, long, action = clap::ArgAction::Count, default_value_t = 0)]
@@ -48,12 +49,21 @@ struct Args {
     #[arg(short, long)]
     command: Option<String>,
 
-    // #[arg(short, long)]
-    // format: Option<String>,
-    #[arg(short, long, value_delimiter = ',')]
-    events: Option<Vec<EventType>>,
+    /// Listen for specific events
+    #[arg(short, long, default_values_t = EventType::iter().collect::<Vec<_>>(), value_delimiter = ',')]
+    events: Vec<EventType>,
 
-    /// the monitoring paths. default cur path if empty
+    /// Exclude all events on files matching the glob <pattern>.
+    /// higher priority than include
+    #[arg(short = 'E', long)]
+    exclude: Option<String>,
+
+    /// include all events on files matching the glob <pattern>.
+    #[arg(short = 'I', long)]
+    include: Option<String>,
+
+    /// the monitoring paths
+    #[clap(default_value = ".")]
     paths: Vec<PathBuf>,
 }
 
@@ -70,9 +80,34 @@ impl Args {
             .init();
         Ok(())
     }
+
+    fn match_opt(&self) -> MatchOptions {
+        MatchOptions {
+            case_sensitive: false,
+            require_literal_separator: false,
+            require_literal_leading_dot: false,
+        }
+    }
+
+    // fn build_paths(&self) -> Result<Vec<PathBuf>> {
+    //     if self.paths.is_empty() {
+    //         bail!("not found any paths")
+    //     }
+    //     let opt = self.match_opt();
+    //     self.paths
+    //         .iter()
+    //         .flat_map(|pat| glob_with(pat, opt))
+    //         .flatten()
+    //         .collect::<Result<Vec<_>, _>>()
+    //         .map_err(Into::into)
+    // }
 }
 
-#[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, ValueEnum, EnumString, Display)]
+#[derive(
+    Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, ValueEnum, EnumString, Display, EnumIter,
+)]
+// clap [clap::Command] attr: rename_all is default kebab-case
+#[strum(serialize_all = "kebab-case")]
 enum EventType {
     Access,
     Modify,
@@ -100,17 +135,51 @@ struct Cli {
     args: Args,
     watcher: Arc<Mutex<RecommendedWatcher>>,
     rx: Receiver<EventInfo>,
+    exclude_pat: Option<Pattern>,
+    include_pat: Option<Pattern>,
 }
 
 impl Cli {
     pub fn new() -> Result<Self> {
-        let mut args = Args::parse();
+        let args = Args::parse();
         args.init_log()?;
 
-        if args.paths.is_empty() {
-            info!("use current path . by default");
-            args.paths.push(".".into());
-        }
+        // debug!("Finding paths using glob {:?}", args.paths);
+        // let mut paths = args.build_paths()?;
+        // trace!(
+        //     "Found {} paths matching the glob `{:?}`: {:?}",
+        //     paths.len(),
+        //     args.paths,
+        //     paths
+        // );
+
+        let exclude_pat = if let Some(s) = args.exclude.as_deref() {
+            let pat = Pattern::new(s)?;
+            // debug!(
+            //     "Filtering {} paths to monitor using option exclude: {}",
+            //     paths.len(),
+            //     s
+            // );
+            // let (excluded, included): (Vec<_>, Vec<_>) = paths
+            //     .into_iter()
+            //     .partition(|p| pat.matches_path_with(p, args.match_opt()));
+            // paths = included;
+            // trace!(
+            //     "filtered {} paths using option exclude `{}`: {:?}",
+            //     excluded.len(),
+            //     s,
+            //     excluded
+            // );
+            Some(pat)
+        } else {
+            None
+        };
+
+        let include_pat = if let Some(s) = args.include.as_deref() {
+            Some(Pattern::new(s)?)
+        } else {
+            None
+        };
 
         let channel_size = 1000;
         let (tx, rx) = sync_channel(channel_size);
@@ -158,6 +227,8 @@ impl Cli {
             args,
             rx,
             watcher: Arc::new(Mutex::new(watcher)),
+            exclude_pat,
+            include_pat,
         })
     }
 
@@ -166,6 +237,29 @@ impl Cli {
         let path_str = e.paths.iter().filter_map(|p| p.to_str()).join(",");
         writeln!(writer, "{} {}", e.event, path_str)?;
         Ok(())
+    }
+
+    fn is_interested(&self, info: &EventInfo) -> bool {
+        self.args.events.iter().any(|e| *e == info.event)
+            && self
+                .exclude_pat
+                .as_ref()
+                .map(|pat| {
+                    info.paths
+                        .iter()
+                        // exclude for all matched
+                        .all(|path| !pat.matches_path_with(path, self.args.match_opt()))
+                })
+                .unwrap_or(true)
+            && self
+                .include_pat
+                .as_ref()
+                .map(|pat| {
+                    info.paths
+                        .iter()
+                        .any(|path| pat.matches_path_with(path, self.args.match_opt()))
+                })
+                .unwrap_or(true)
     }
 
     fn start(&self) -> Result<()> {
@@ -182,16 +276,12 @@ impl Cli {
         }
 
         let timeout: Duration = self.args.poll_interval.into();
-        let interested_events = self.args.events.as_ref();
         println!(
-            "waiting {} events in interval {}s for {}paths: {:?}",
-            if let Some(es) = interested_events {
-                format!("{es:?}")
-            } else {
-                "all".to_string()
-            },
+            "waiting {:?} events in interval {}s for {}{} paths: {:?}",
+            self.args.events,
             timeout.as_secs(),
             if self.args.recurive { "recurive " } else { "" },
+            paths.len(),
             paths
         );
 
@@ -204,10 +294,7 @@ impl Cli {
             );
             match self.rx.recv_timeout(timeout) {
                 Ok(info) => {
-                    if interested_events
-                        .filter(|es| es.iter().all(|e| *e != info.event))
-                        .is_some()
-                    {
+                    if !self.is_interested(&info) {
                         trace!("skipped received event {info:?}");
                         continue;
                     }
