@@ -510,13 +510,15 @@ mod tests {
         let args = Args::parse_from(format!(r#"{CRATE_NAME} -I {pat} dot_xxx"#).split(' '));
         let info = EventInfo {
             event: EventType::Create,
-            paths: vec![Path::new("/home/xxx/.local/share/chezmoi/dot_xxx/etc/systemd/exact_system/a.service.tmpl").to_path_buf()],
+            paths: vec![Path::new(
+                "/home/xxx/.local/share/chezmoi/dot_xxx/etc/systemd/exact_system/a.service.tmpl",
+            )
+            .to_path_buf()],
         };
         let info2 = EventInfo {
             event: EventType::Create,
             paths: vec![
-                Path::new("/home/xxx/.local/share/chezmoi/dot_xxx/etc/wsl.conf.tmpl")
-                    .to_path_buf(),
+                Path::new("/home/xxx/.local/share/chezmoi/dot_xxx/etc/wsl.conf.tmpl").to_path_buf(),
             ],
         };
 
