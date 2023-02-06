@@ -12,17 +12,24 @@ use std::{
 use anyhow::{anyhow, bail, Result};
 use clap::{Parser, ValueEnum};
 use fake_tty::make_script_command;
-use glob::{MatchOptions, Pattern};
+use globset::{Glob, GlobBuilder, GlobSet, GlobSetBuilder};
 use itertools::Itertools;
 use log::{debug, info, trace, warn};
 use notify::{Event, RecommendedWatcher, RecursiveMode, Watcher};
 use strum::{Display, EnumIter, EnumString, IntoEnumIterator};
 
 fn main() {
-    if let Err(e) = Cli::new().and_then(|cli| cli.start()) {
+    if let Err(e) = run() {
         eprintln!("failed to run cli: {e}");
         exit(1)
     }
+}
+
+fn run() -> Result<()> {
+    let args = Args::parse();
+    args.init_log()?;
+
+    Cli::new(&args).and_then(|cli| cli.start())
 }
 
 /// A simple project to monitor file events and run commands
@@ -53,14 +60,14 @@ struct Args {
     #[arg(short, long, default_values_t = EventType::iter().collect::<Vec<_>>(), value_delimiter = ',')]
     events: Vec<EventType>,
 
-    /// Exclude all events on files matching the glob <pattern>.
+    /// Exclude all events on files matching the globs <pattern>.
     /// higher priority than include
     #[arg(short = 'E', long)]
-    exclude: Option<String>,
+    excludes: Option<Vec<String>>,
 
-    /// include all events on files matching the glob <pattern>.
+    /// include all events on files matching the globs <pattern>.
     #[arg(short = 'I', long)]
-    include: Option<String>,
+    includes: Option<Vec<String>>,
 
     /// the monitoring paths
     #[clap(default_value = ".")]
@@ -81,26 +88,13 @@ impl Args {
         Ok(())
     }
 
-    fn match_opt(&self) -> MatchOptions {
-        MatchOptions {
-            case_sensitive: false,
-            require_literal_separator: false,
-            require_literal_leading_dot: false,
-        }
+    fn build_glob(&self, s: &str) -> Result<Glob> {
+        GlobBuilder::new(s)
+            .case_insensitive(false)
+            // .literal_separator(true)
+            .build()
+            .map_err(Into::into)
     }
-
-    // fn build_paths(&self) -> Result<Vec<PathBuf>> {
-    //     if self.paths.is_empty() {
-    //         bail!("not found any paths")
-    //     }
-    //     let opt = self.match_opt();
-    //     self.paths
-    //         .iter()
-    //         .flat_map(|pat| glob_with(pat, opt))
-    //         .flatten()
-    //         .collect::<Result<Vec<_>, _>>()
-    //         .map_err(Into::into)
-    // }
 }
 
 #[derive(
@@ -131,55 +125,47 @@ struct EventInfo {
     paths: Vec<PathBuf>,
 }
 
-struct Cli {
-    args: Args,
+struct Cli<'a> {
+    args: &'a Args,
     watcher: Arc<Mutex<RecommendedWatcher>>,
     rx: Receiver<EventInfo>,
-    exclude_pat: Option<Pattern>,
-    include_pat: Option<Pattern>,
+    exclude_globs: Option<GlobSet>,
+    include_globs: Option<GlobSet>,
 }
 
-impl Cli {
-    pub fn new() -> Result<Self> {
-        let args = Args::parse();
-        args.init_log()?;
+impl<'a> Cli<'a> {
+    pub fn new(args: &'a Args) -> Result<Self> {
+        let exclude_globs = args
+            .excludes
+            .as_deref()
+            .map(|globs| {
+                globs
+                    .iter()
+                    .map(|s| args.build_glob(s))
+                    .fold_ok(GlobSetBuilder::new(), |mut b, g| {
+                        b.add(g);
+                        b
+                    })
+                    .and_then(|b| b.build().map_err(Into::into))
+                    .map(Some)
+            })
+            .unwrap_or(Ok(None))?;
 
-        // debug!("Finding paths using glob {:?}", args.paths);
-        // let mut paths = args.build_paths()?;
-        // trace!(
-        //     "Found {} paths matching the glob `{:?}`: {:?}",
-        //     paths.len(),
-        //     args.paths,
-        //     paths
-        // );
-
-        let exclude_pat = if let Some(s) = args.exclude.as_deref() {
-            let pat = Pattern::new(s)?;
-            // debug!(
-            //     "Filtering {} paths to monitor using option exclude: {}",
-            //     paths.len(),
-            //     s
-            // );
-            // let (excluded, included): (Vec<_>, Vec<_>) = paths
-            //     .into_iter()
-            //     .partition(|p| pat.matches_path_with(p, args.match_opt()));
-            // paths = included;
-            // trace!(
-            //     "filtered {} paths using option exclude `{}`: {:?}",
-            //     excluded.len(),
-            //     s,
-            //     excluded
-            // );
-            Some(pat)
-        } else {
-            None
-        };
-
-        let include_pat = if let Some(s) = args.include.as_deref() {
-            Some(Pattern::new(s)?)
-        } else {
-            None
-        };
+        let include_globs = args
+            .includes
+            .as_deref()
+            .map(|globs| {
+                globs
+                    .iter()
+                    .map(|s| args.build_glob(s))
+                    .fold_ok(GlobSetBuilder::new(), |mut b, g| {
+                        b.add(g);
+                        b
+                    })
+                    .and_then(|b| b.build().map_err(Into::into))
+                    .map(Some)
+            })
+            .unwrap_or(Ok(None))?;
 
         let channel_size = 1000;
         let (tx, rx) = sync_channel(channel_size);
@@ -227,8 +213,8 @@ impl Cli {
             args,
             rx,
             watcher: Arc::new(Mutex::new(watcher)),
-            exclude_pat,
-            include_pat,
+            exclude_globs,
+            include_globs,
         })
     }
 
@@ -242,23 +228,15 @@ impl Cli {
     fn is_interested(&self, info: &EventInfo) -> bool {
         self.args.events.iter().any(|e| *e == info.event)
             && self
-                .exclude_pat
+                .exclude_globs
                 .as_ref()
-                .map(|pat| {
-                    info.paths
-                        .iter()
-                        // exclude for all matched
-                        .all(|path| !pat.matches_path_with(path, self.args.match_opt()))
-                })
+                // exclude for all matched
+                .map(|gs| info.paths.iter().all(|path| !gs.is_match(path)))
                 .unwrap_or(true)
             && self
-                .include_pat
+                .include_globs
                 .as_ref()
-                .map(|pat| {
-                    info.paths
-                        .iter()
-                        .any(|path| pat.matches_path_with(path, self.args.match_opt()))
-                })
+                .map(|gs| info.paths.iter().any(|path| gs.is_match(path)))
                 .unwrap_or(true)
     }
 
@@ -305,7 +283,7 @@ impl Cli {
                             // check child still live?
                             if let Some(status) = child.try_wait()? {
                                 // terminated
-                                trace!(
+                                debug!(
                                     "cleaning exited status {:?} for process {}",
                                     status.code(),
                                     child.id()
@@ -392,5 +370,88 @@ impl Cli {
                 .spawn()
         }
         .map_err(Into::into)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use log::LevelFilter;
+    use std::{
+        env, fs,
+        path::Path,
+        sync::{mpsc::channel, Once},
+    };
+    use tempfile::tempdir;
+
+    static CRATE_NAME: &str = env!("CARGO_CRATE_NAME");
+
+    #[ctor::ctor]
+    fn init() {
+        static INIT: Once = Once::new();
+        INIT.call_once(|| {
+            env_logger::builder()
+                .is_test(true)
+                .filter_level(LevelFilter::Info)
+                .filter_module(CRATE_NAME, LevelFilter::Trace)
+                .init();
+        });
+    }
+
+    #[test]
+    fn test_args() -> Result<()> {
+        let args = Args::parse_from::<&[&str], _>(&[]);
+        assert_eq!(args.events, EventType::iter().collect::<Vec<_>>());
+        assert_eq!(args.paths, vec![Path::new(".").to_owned()]);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_interested() -> Result<()> {
+        let tempdir = tempdir()?;
+        env::set_current_dir(&tempdir)?;
+        let cur_path = Path::new(".");
+
+        let tmpfile_path = tempdir.path().join("a.txt");
+        let (tx, rx) = channel();
+        let mut watcher = notify::recommended_watcher(tx)?;
+        trace!("watching path {}", cur_path.display());
+        watcher.watch(cur_path, RecursiveMode::NonRecursive)?;
+
+        {
+            info!("writing {} for watching", tmpfile_path.display());
+            fs::write(&tmpfile_path, "2323")?;
+        }
+
+        let timeout = Duration::from_secs(2);
+        info!("waiting timeout {}s for watching", timeout.as_secs());
+        let event = rx.recv_timeout(timeout)??;
+        assert_eq!(event.paths.first(), Some(&tmpfile_path));
+        // "/tmp/.tmpb9lPL7/./a.txt" = "/tmp/.tmpb9lPL7/a.txt"
+        assert_ne!(event.paths.first().unwrap().to_str(), tmpfile_path.to_str());
+
+        let _event_path = event.paths.first().unwrap();
+        let info = EventInfo {
+            event: EventType::Create,
+            paths: vec![tmpfile_path],
+        };
+
+        let args =
+            Args::parse_from(format!("{CRATE_NAME} -E *.txt {}", cur_path.display()).split(' '));
+        assert!(!Cli::new(&args)?.is_interested(&info));
+
+        let args =
+            Args::parse_from(format!("{CRATE_NAME} -E **/* {}", cur_path.display()).split(' '));
+        assert!(!Cli::new(&args)?.is_interested(&info));
+
+        let args =
+            Args::parse_from(format!("{CRATE_NAME} -E *.jpg {}", cur_path.display()).split(' '));
+        assert!(Cli::new(&args)?.is_interested(&info));
+
+        let args = Args::parse_from(format!("{CRATE_NAME} {}", cur_path.display()).split(' '));
+        assert!(Cli::new(&args)?.is_interested(&info));
+
+        Ok(())
     }
 }
