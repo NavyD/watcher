@@ -103,7 +103,7 @@ impl Args {
     fn build_glob(&self, s: &str) -> Result<Glob> {
         GlobBuilder::new(s)
             .case_insensitive(false)
-            // .literal_separator(true)
+            .literal_separator(true)
             .build()
             .map_err(Into::into)
     }
@@ -389,6 +389,7 @@ impl<'a> Cli<'a> {
 mod tests {
     use super::*;
     use log::LevelFilter;
+    use rand::{distributions::Alphanumeric, Rng};
     use std::{
         env, fs,
         path::Path,
@@ -405,7 +406,7 @@ mod tests {
             env_logger::builder()
                 .is_test(true)
                 .filter_level(LevelFilter::Info)
-                .filter_module(CRATE_NAME, LevelFilter::Trace)
+                .filter_module(CRATE_NAME, LevelFilter::Debug)
                 .init();
         });
     }
@@ -421,49 +422,111 @@ mod tests {
 
     #[test]
     fn test_interested() -> Result<()> {
-        let tempdir = tempdir()?;
-        env::set_current_dir(&tempdir)?;
+        let dir = tempdir()?;
+        env::set_current_dir(&dir)?;
         let cur_path = Path::new(".");
 
-        let tmpfile_path = tempdir.path().join("a.txt");
+        // a/a.txt
+        // a/b/b.txt
+        // a/b/c/c.txt
+        let mut tmp_paths = ["a/b/c/c.txt", "a/b/b.txt", "a/a.txt"].map(|s| dir.path().join(s));
+        tmp_paths.sort();
+        fs::create_dir_all(tmp_paths.last().and_then(|p| p.parent()).unwrap())?;
+
         let (tx, rx) = channel();
         let mut watcher = notify::recommended_watcher(tx)?;
-        trace!("watching path {}", cur_path.display());
-        watcher.watch(cur_path, RecursiveMode::NonRecursive)?;
+        trace!("watching recursive path {}", cur_path.display());
+        watcher.watch(cur_path, RecursiveMode::Recursive)?;
 
-        {
-            info!("writing {} for watching", tmpfile_path.display());
-            fs::write(&tmpfile_path, "2323")?;
+        // write tmp paths
+        let rand_write = |path: &Path| {
+            let s = rand::thread_rng()
+                .sample_iter(&Alphanumeric)
+                .take(10)
+                .map(char::from)
+                .collect::<String>();
+            trace!("writing {} for watching with content: {s}", path.display());
+            fs::write(path, s)?;
+            Ok::<_, anyhow::Error>(())
+        };
+        for p in &tmp_paths {
+            rand_write(p)?;
         }
 
-        let timeout = Duration::from_secs(2);
+        let timeout = Duration::from_secs(1);
         info!("waiting timeout {}s for watching", timeout.as_secs());
-        let event = rx.recv_timeout(timeout)??;
-        assert_eq!(event.paths.first(), Some(&tmpfile_path));
-        // "/tmp/.tmpb9lPL7/./a.txt" = "/tmp/.tmpb9lPL7/a.txt"
-        assert_ne!(event.paths.first().unwrap().to_str(), tmpfile_path.to_str());
 
-        let _event_path = event.paths.first().unwrap();
+        // get events for watch tmp paths
+        let mut events = vec![];
+        loop {
+            match rx.recv_timeout(timeout) {
+                Ok(e) => {
+                    trace!("received {e:?}");
+                    events.push(e?)
+                }
+                Err(e) => {
+                    debug!("break on received error: {e}");
+                    drop(watcher);
+                    break;
+                }
+            }
+        }
+
+        info!("found {} events", events.len());
+        // multi-events on one path. create,modify,access
+        assert!(events.len() > tmp_paths.len());
+        assert!(tmp_paths
+            .iter()
+            .all(|p| events.iter().any(|e| e.paths.contains(p))));
+
+        let event_paths = events
+            .iter()
+            .flat_map(|e| e.paths.iter())
+            .cloned()
+            .dedup()
+            .sorted()
+            .collect::<Vec<_>>();
+        assert_eq!(event_paths, tmp_paths);
+
+        // exclude last a/b/c/c.txt
+        let args =
+            Args::parse_from(format!("{CRATE_NAME} -E **/c/* {}", cur_path.display()).split(' '));
+
+        let cli = Cli::new(&args)?;
+        assert!(!cli.is_interested(&EventInfo {
+            event: EventType::Create,
+            paths: vec![tmp_paths.last().cloned().unwrap()],
+        }));
+        assert!(cli.is_interested(&EventInfo {
+            event: EventType::Create,
+            paths: vec![tmp_paths.first().cloned().unwrap()],
+        }));
+        Ok(())
+    }
+
+    #[test]
+    fn test_interested_mock() -> Result<()> {
+        let pat = "**/etc/*";
+        let args = Args::parse_from(format!(r#"{CRATE_NAME} -I {pat} dot_xxx"#).split(' '));
         let info = EventInfo {
             event: EventType::Create,
-            paths: vec![tmpfile_path],
+            paths: vec![Path::new("/home/xxx/.local/share/chezmoi/dot_xxx/etc/systemd/exact_system/a.service.tmpl").to_path_buf()],
+        };
+        let info2 = EventInfo {
+            event: EventType::Create,
+            paths: vec![
+                Path::new("/home/xxx/.local/share/chezmoi/dot_xxx/etc/wsl.conf.tmpl")
+                    .to_path_buf(),
+            ],
         };
 
-        let args =
-            Args::parse_from(format!("{CRATE_NAME} -E *.txt {}", cur_path.display()).split(' '));
-        assert!(!Cli::new(&args)?.is_interested(&info));
+        let cli = Cli::new(&args)?;
+        let globs = cli.include_globs.as_ref().unwrap();
+        assert!(!globs.is_match(&info.paths[0]));
+        assert!(globs.is_match(&info2.paths[0]));
 
-        let args =
-            Args::parse_from(format!("{CRATE_NAME} -E **/* {}", cur_path.display()).split(' '));
-        assert!(!Cli::new(&args)?.is_interested(&info));
-
-        let args =
-            Args::parse_from(format!("{CRATE_NAME} -E *.jpg {}", cur_path.display()).split(' '));
-        assert!(Cli::new(&args)?.is_interested(&info));
-
-        let args = Args::parse_from(format!("{CRATE_NAME} {}", cur_path.display()).split(' '));
-        assert!(Cli::new(&args)?.is_interested(&info));
-
+        assert!(!cli.is_interested(&info));
+        assert!(cli.is_interested(&info2));
         Ok(())
     }
 }
