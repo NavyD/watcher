@@ -10,7 +10,8 @@ use std::{
 };
 
 use anyhow::{anyhow, bail, Result};
-use clap::{Parser, ValueEnum};
+use clap::{CommandFactory, Parser, ValueEnum, ValueHint};
+use clap_complete::{generate, Shell};
 use fake_tty::make_script_command;
 use globset::{Glob, GlobBuilder, GlobSet, GlobSetBuilder};
 use itertools::Itertools;
@@ -29,13 +30,24 @@ fn run() -> Result<()> {
     let args = Args::parse();
     args.init_log()?;
 
-    Cli::new(&args).and_then(|cli| cli.start())
+    if let Some(sh) = args.generator {
+        let mut cmd = Args::command();
+        let name = cmd.get_name().to_string();
+        generate(sh, &mut cmd, name, &mut io::stdout());
+        Ok(())
+    } else {
+        Cli::new(&args).and_then(|cli| cli.start())
+    }
 }
 
 /// A simple project to monitor file events and run commands
 #[derive(Parser, Debug)]
 #[command(author, version)]
 struct Args {
+    /// outputs the completion file for given shell
+    #[arg(long = "generate", value_enum)]
+    generator: Option<Shell>,
+
     /// log level. default off
     #[arg(short, long, action = clap::ArgAction::Count, default_value_t = 0)]
     verbose: u8,
@@ -53,7 +65,7 @@ struct Args {
     tty: bool,
 
     /// run a command and send event to the stdin
-    #[arg(short, long)]
+    #[arg(short, long, value_hint = ValueHint::CommandString)]
     command: Option<String>,
 
     /// Listen for specific events
@@ -62,15 +74,15 @@ struct Args {
 
     /// Exclude all events on files matching the globs <pattern>.
     /// higher priority than include
-    #[arg(short = 'E', long)]
+    #[arg(short = 'E', long, value_hint = ValueHint::Unknown)]
     excludes: Option<Vec<String>>,
 
     /// include all events on files matching the globs <pattern>.
-    #[arg(short = 'I', long)]
+    #[arg(short = 'I', long, value_hint = ValueHint::Unknown)]
     includes: Option<Vec<String>>,
 
     /// the monitoring paths
-    #[clap(default_value = ".")]
+    #[clap(default_value = ".", value_hint = ValueHint::AnyPath)]
     paths: Vec<PathBuf>,
 }
 

@@ -1,0 +1,49 @@
+#compdef watcher
+
+autoload -U is-at-least
+
+_watcher() {
+    typeset -A opt_args
+    typeset -a _arguments_options
+    local ret=1
+
+    if is-at-least 5.2; then
+        _arguments_options=(-s -S -C)
+    else
+        _arguments_options=(-s -C)
+    fi
+
+    local context curcontext="$curcontext" state line
+    _arguments "${_arguments_options[@]}" \
+'--generate=[]:GENERATOR:(bash elvish fish powershell zsh)' \
+'-i+[Timeout for rechecking monitoring events]:POLL_INTERVAL: ' \
+'--poll-interval=[Timeout for rechecking monitoring events]:POLL_INTERVAL: ' \
+'-c+[run a command and send event to the stdin]:COMMAND:_cmdstring' \
+'--command=[run a command and send event to the stdin]:COMMAND:_cmdstring' \
+'*-e+[Listen for specific events]:EVENTS:(access modify move create delete)' \
+'*--events=[Listen for specific events]:EVENTS:(access modify move create delete)' \
+'*-E+[Exclude all events on files matching the globs <pattern>. higher priority than include]:EXCLUDES: ' \
+'*--excludes=[Exclude all events on files matching the globs <pattern>. higher priority than include]:EXCLUDES: ' \
+'*-I+[include all events on files matching the globs <pattern>]:INCLUDES: ' \
+'*--includes=[include all events on files matching the globs <pattern>]:INCLUDES: ' \
+'*-v[log level. default off]' \
+'*--verbose[log level. default off]' \
+'-r[recursive for paths]' \
+'--recurive[recursive for paths]' \
+'-t[Run a command in sh, pretending to be a tty. useful for example: docker exec]' \
+'--tty[Run a command in sh, pretending to be a tty. useful for example: docker exec]' \
+'-h[Print help]' \
+'--help[Print help]' \
+'-V[Print version]' \
+'--version[Print version]' \
+'*::paths -- the monitoring paths:_files' \
+&& ret=0
+}
+
+(( $+functions[_watcher_commands] )) ||
+_watcher_commands() {
+    local commands; commands=()
+    _describe -t commands 'watcher commands' commands "$@"
+}
+
+_watcher "$@"
