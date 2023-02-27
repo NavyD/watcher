@@ -510,16 +510,15 @@ mod tests {
         let args = Args::parse_from(format!(r#"{CRATE_NAME} -I {pat} dot_xxx"#).split(' '));
         let info = EventInfo {
             event: EventType::Create,
-            paths: vec![Path::new(
+            paths: vec![PathBuf::from(
                 "/home/xxx/.local/share/chezmoi/dot_xxx/etc/systemd/exact_system/a.service.tmpl",
-            )
-            .to_path_buf()],
+            )],
         };
         let info2 = EventInfo {
             event: EventType::Create,
-            paths: vec![
-                Path::new("/home/xxx/.local/share/chezmoi/dot_xxx/etc/wsl.conf.tmpl").to_path_buf(),
-            ],
+            paths: vec![PathBuf::from(
+                "/home/xxx/.local/share/chezmoi/dot_xxx/etc/wsl.conf.tmpl",
+            )],
         };
 
         let cli = Cli::new(&args)?;
@@ -529,6 +528,46 @@ mod tests {
 
         assert!(!cli.is_interested(&info));
         assert!(cli.is_interested(&info2));
+        Ok(())
+    }
+
+    #[test]
+    fn test_interested_excludes() -> Result<()> {
+        let pat = "**/avs/failed/**";
+        let args = Args::parse_from(format!(r#"{CRATE_NAME} -E {pat} dot_xxx"#).split(' '));
+        let info = EventInfo {
+            event: EventType::Create,
+            paths: vec![PathBuf::from(
+                "/home/xxx/.local/share/chezmoi/dot_xxx/avs/JAV_output/etc/systemd/exact_system/a.service.tmpl",
+            )],
+        };
+        let info2 = EventInfo {
+            event: EventType::Create,
+            paths: vec![PathBuf::from(
+                "/home/xxx/.local/share/chezmoi/dot_xxx/avs/failed/etc/wsl.conf.tmpl",
+            )],
+        };
+
+        let cli = Cli::new(&args)?;
+        let globs = cli.exclude_globs.as_ref().unwrap();
+        assert!(!globs.is_match(&info.paths[0]));
+        assert!(globs.is_match(&info2.paths[0]));
+
+        assert!(cli.is_interested(&info));
+        assert!(!cli.is_interested(&info2));
+
+        let pat = "**/avs/failed/**";
+        let args = Args::parse_from(format!(r#"{CRATE_NAME} -E {pat} dot_xxx"#).split(' '));
+        let info = EventInfo {
+            event: EventType::Create,
+            paths: vec![PathBuf::from(
+                "/home/xxx/.local/share/chezmoi/dot_xxx/avs/failed",
+            )],
+        };
+        let cli = Cli::new(&args)?;
+        let globs = cli.exclude_globs.as_ref().unwrap();
+        assert!(!globs.is_match(&info.paths[0]));
+        assert!(cli.is_interested(&info));
         Ok(())
     }
 }

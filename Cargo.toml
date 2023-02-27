@@ -1,6 +1,6 @@
 [package]
 name = "watcher"
-version = "0.4.2"
+version = "0.4.3"
 edition = "2021"
 rust-version = "1.67" # std::sync::mpsc implementation updated based on crossbeam-channel. 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
@@ -28,3 +28,5 @@ rand = "0.8"
 lto = true
 strip = true
 opt-level = "z"
+panic = "abort"
+codegen-units = 1
