@@ -28,5 +28,4 @@ rand = "0.8"
 lto = true
 strip = true
 opt-level = "z"
-panic = "abort"
 codegen-units = 1
