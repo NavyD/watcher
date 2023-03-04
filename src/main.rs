@@ -110,10 +110,10 @@ pub struct Args {
 impl Args {
     fn init_log(&self) -> Result<()> {
         let verbose = self.verbose;
-        if verbose > 4 {
-            return Err(anyhow!("invalid arg: 4 < {} number of verbose", verbose));
+        if verbose > 5 {
+            return Err(anyhow!("invalid log level {} number of verbose", verbose));
         }
-        let level: log::LevelFilter = unsafe { std::mem::transmute((verbose + 1) as usize) };
+        let level: log::LevelFilter = unsafe { std::mem::transmute(verbose as usize) };
         env_logger::builder()
             .filter_level(log::LevelFilter::Error)
             .filter_module(module_path!(), level)
@@ -397,28 +397,25 @@ pub trait ProcessHandler: Handler {
 
     fn spawn(&self) -> Result<Child> {
         let args = self.process_args();
+        debug!("spawning new process with args: {args:?}");
         let cmd = &args.command;
-        println!("starting new process with args: `{args:?}`");
+        println!("starting new process by command: `{cmd}`");
+
+        let stdin = if args.send_stdin {
+            Stdio::piped()
+        } else {
+            Stdio::inherit()
+        };
         if args.tty {
             let sh = "sh";
             trace!("executing command `{cmd}` in tty {sh}");
-            make_script_command(cmd, Some(sh)).and_then(|mut c| c.stdin(Stdio::piped()).spawn())
+            make_script_command(cmd, Some(sh)).and_then(|mut c| c.stdin(stdin).spawn())
         } else {
             let cmd_args =
                 shlex::split(cmd).ok_or_else(|| anyhow!("Unable to parse the command: {cmd}"))?;
-
             trace!("executing command `{cmd}` with args: {cmd_args:?}");
             let name = &cmd_args[0];
-            Command::new(name)
-                .args(&cmd_args[1..])
-                .stdin(if args.send_stdin {
-                    Stdio::piped()
-                } else {
-                    Stdio::inherit()
-                })
-                // .stdout(Stdio::piped())
-                // .stderr(Stdio::piped())
-                .spawn()
+            Command::new(name).args(&cmd_args[1..]).stdin(stdin).spawn()
         }
         .map_err(Into::into)
     }
