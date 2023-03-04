@@ -2,10 +2,7 @@ use std::{
     io::{self, Write},
     path::PathBuf,
     process::{exit, Child, Command, Stdio},
-    sync::{
-        mpsc::{sync_channel, Receiver, RecvTimeoutError},
-        Arc, Mutex,
-    },
+    sync::mpsc::{sync_channel, Receiver, RecvTimeoutError},
     time::Duration,
 };
 
@@ -15,7 +12,7 @@ use clap_complete::{generate, Shell};
 use fake_tty::make_script_command;
 use globset::{Glob, GlobBuilder, GlobSet, GlobSetBuilder};
 use itertools::Itertools;
-use log::{debug, info, trace, warn, error};
+use log::{debug, error, info, trace, warn};
 use notify::{Event, RecommendedWatcher, RecursiveMode, Watcher};
 use strum::{Display, EnumIter, EnumString, IntoEnumIterator};
 
@@ -36,14 +33,31 @@ fn run() -> Result<()> {
         generate(sh, &mut cmd, name, &mut io::stdout());
         Ok(())
     } else {
-        Cli::new(&args).and_then(|cli| cli.start())
+        let mut watcher = EventWatcher::new(&args)?;
+        watcher.start()?;
+
+        if let Some(command) = args.command {
+            match args.run_mode {
+                RunMode::Single => {
+                    let pargs = ProcessArgs {
+                        command,
+                        send_stdin: args.send_stdin,
+                        tty: args.tty,
+                    };
+                    SingleProcessHandler::new(pargs).handle(watcher)?;
+                }
+            }
+        } else {
+            SimpleHandler.handle(watcher)?;
+        }
+        todo!()
     }
 }
 
 /// A simple project to monitor file events and run commands
 #[derive(Parser, Debug)]
 #[command(author, version)]
-struct Args {
+pub struct Args {
     /// outputs the completion file for given shell
     #[arg(long = "generate", value_enum)]
     generator: Option<Shell>,
@@ -57,15 +71,19 @@ struct Args {
     recurive: bool,
 
     /// Timeout for rechecking monitoring events
-    #[arg(short = 'i', long, default_value = "30s")]
+    #[arg(short = 'i', long, default_value = "1s")]
     poll_interval: humantime::Duration,
 
     /// Run a command in sh, pretending to be a tty. useful for example: docker exec
     #[arg(short, long, default_value_t = false)]
     tty: bool,
 
+    /// send events to process stdin
     #[arg(long, default_value_t = false)]
-    process_stdin: bool,
+    send_stdin: bool,
+
+    #[arg(short = 'm', long, default_value_t = RunMode::Single)]
+    run_mode: RunMode,
 
     /// run a command and send event to the stdin
     #[arg(short, long, value_hint = ValueHint::CommandString)]
@@ -110,6 +128,49 @@ impl Args {
             .build()
             .map_err(Into::into)
     }
+
+    fn build_include_globs(&self) -> Result<Option<GlobSet>> {
+        self.includes
+            .as_deref()
+            .map(|globs| {
+                globs
+                    .iter()
+                    .map(|s| self.build_glob(s))
+                    .fold_ok(GlobSetBuilder::new(), |mut b, g| {
+                        b.add(g);
+                        b
+                    })
+                    .and_then(|b| b.build().map_err(Into::into))
+                    .map(Some)
+            })
+            .unwrap_or(Ok(None))
+    }
+
+    fn build_exclude_globs(&self) -> Result<Option<GlobSet>> {
+        self.excludes
+            .as_deref()
+            .map(|globs| {
+                globs
+                    .iter()
+                    .map(|s| self.build_glob(s))
+                    .fold_ok(GlobSetBuilder::new(), |mut b, g| {
+                        b.add(g);
+                        b
+                    })
+                    .and_then(|b| b.build().map_err(Into::into))
+                    .map(Some)
+            })
+            .unwrap_or(Ok(None))
+    }
+}
+
+#[derive(
+    Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, ValueEnum, EnumString, Display, EnumIter,
+)]
+// clap [clap::Command] attr: rename_all is default kebab-case
+#[strum(serialize_all = "kebab-case")]
+enum RunMode {
+    Single,
 }
 
 #[derive(
@@ -140,299 +201,20 @@ pub struct EventInfo {
     paths: Vec<PathBuf>,
 }
 
-struct Cli<'a> {
-    args: &'a Args,
-    watcher: Arc<Mutex<RecommendedWatcher>>,
+pub struct EventWatcher {
+    watcher: Option<RecommendedWatcher>,
     rx: Receiver<EventInfo>,
-    exclude_globs: Option<GlobSet>,
-    include_globs: Option<GlobSet>,
+    event_filter: EventFilter,
+    timeout: Duration,
+    recurive: bool,
+    paths: Vec<PathBuf>,
 }
 
-impl<'a> Cli<'a> {
-    pub fn new(args: &'a Args) -> Result<Self> {
-        let exclude_globs = args
-            .excludes
-            .as_deref()
-            .map(|globs| {
-                globs
-                    .iter()
-                    .map(|s| args.build_glob(s))
-                    .fold_ok(GlobSetBuilder::new(), |mut b, g| {
-                        b.add(g);
-                        b
-                    })
-                    .and_then(|b| b.build().map_err(Into::into))
-                    .map(Some)
-            })
-            .unwrap_or(Ok(None))?;
-
-        let include_globs = args
-            .includes
-            .as_deref()
-            .map(|globs| {
-                globs
-                    .iter()
-                    .map(|s| args.build_glob(s))
-                    .fold_ok(GlobSetBuilder::new(), |mut b, g| {
-                        b.add(g);
-                        b
-                    })
-                    .and_then(|b| b.build().map_err(Into::into))
-                    .map(Some)
-            })
-            .unwrap_or(Ok(None))?;
-
+impl EventWatcher {
+    pub fn new(args: &Args) -> Result<Self> {
         let channel_size = 1000;
         let (tx, rx) = sync_channel(channel_size);
-        let watcher = notify::recommended_watcher(
-            move |res: Result<Event, notify::Error>| match res {
-                Ok(e) => {
-                    trace!(
-                        "found {:?} event in {:?} has attrs {:?}",
-                        e.kind,
-                        e.paths,
-                        e.attrs
-                    );
-
-                    use notify::EventKind;
-                    let event_type = match e.kind {
-                        EventKind::Access(_) => EventType::Access,
-                        EventKind::Create(_) => EventType::Create,
-                        EventKind::Modify(_) => EventType::Modify,
-                        EventKind::Remove(_) => EventType::Delete,
-                        _ => {
-                            info!("Ignore unsupported event {:?} in {:?}", e.kind, e.paths);
-                            return;
-                        }
-                    };
-                    let info = EventInfo {
-                        event: event_type,
-                        paths: e.paths,
-                    };
-
-                    use std::sync::mpsc::{SendError, TrySendError};
-                    tx.try_send(info).or_else(|e| match e {
-                        TrySendError::Full(info) => {
-                            // 在事件b到达时被通道阻塞，正在重试并等待通道可用
-                            warn!("Blocked by channel on event {info:?} arrival, retrying and waiting for channel availability");
-                            tx.send(info)
-                        },
-                        TrySendError::Disconnected(info) => Err(SendError(info))
-                    }).unwrap();
-                }
-                Err(e) => warn!("ignore an error found during monitoring: {e}"),
-            },
-        )?;
-
-        Ok(Self {
-            args,
-            rx,
-            watcher: Arc::new(Mutex::new(watcher)),
-            exclude_globs,
-            include_globs,
-        })
-    }
-
-    fn format(&self, e: &EventInfo, writer: &mut impl Write) -> Result<()> {
-        // TODO: format
-        let path_str = e.paths.iter().filter_map(|p| p.to_str()).join(",");
-        writeln!(writer, "{} {}", e.event, path_str)?;
-        Ok(())
-    }
-
-    fn is_interested(&self, info: &EventInfo) -> bool {
-        self.args.events.iter().any(|e| *e == info.event)
-            && self
-                .exclude_globs
-                .as_ref()
-                // exclude for all matched
-                .map(|gs| info.paths.iter().all(|path| !gs.is_match(path)))
-                .unwrap_or(true)
-            && self
-                .include_globs
-                .as_ref()
-                .map(|gs| info.paths.iter().any(|path| gs.is_match(path)))
-                .unwrap_or(true)
-    }
-
-    fn start(&self) -> Result<()> {
-        // start watch paths
-        let mut watcher = self.watcher.lock().map_err(|e| anyhow!("{e}"))?;
-        let rec_mod = if self.args.recurive {
-            RecursiveMode::Recursive
-        } else {
-            RecursiveMode::NonRecursive
-        };
-        let paths = &self.args.paths;
-        for path in paths {
-            watcher.watch(path, rec_mod)?;
-        }
-
-        let timeout: Duration = self.args.poll_interval.into();
-        println!(
-            "waiting {:?} events in interval {}s for {}{} paths: {:?}",
-            self.args.events,
-            timeout.as_secs(),
-            if self.args.recurive { "recurive " } else { "" },
-            paths.len(),
-            paths
-        );
-
-        let mut cur_child = None::<Child>;
-        let mut last_info = None::<EventInfo>;
-        loop {
-            trace!(
-                "waiting timeout {}s for last info: {last_info:?}",
-                timeout.as_secs()
-            );
-            match self.rx.recv_timeout(timeout) {
-                Ok(info) => {
-                    if !self.is_interested(&info) {
-                        trace!("skipped received event {info:?}");
-                        continue;
-                    }
-
-                    info!("found new event {} in path {:?}", info.event, info.paths);
-                    if let Some(_cmd) = self.args.command.as_deref() {
-                        if let Some(child) = cur_child.as_mut() {
-                            // check child still live?
-                            if let Some(status) = child.try_wait()? {
-                                // terminated
-                                debug!(
-                                    "cleaning exited status {:?} for process {}",
-                                    status.code(),
-                                    child.id()
-                                );
-
-                                // rerun for next timeout
-                                cur_child.take();
-                            } else {
-                                // alive
-                                trace!("Writing info `{info:?}` to be formatted to the stdin of existing process {}", child.id());
-                                // dont close stdin, only release lock to unblock
-                                self.format(&info, child.stdin.as_mut().unwrap())?;
-
-                                last_info = None;
-                                continue;
-                            }
-                        }
-
-                        last_info = Some(info);
-                    } else {
-                        trace!("Writing info `{info:?}` to be formatted to the stdout");
-                        self.format(&info, &mut io::stdout())?;
-                    }
-                }
-                Err(RecvTimeoutError::Timeout) => {
-                    if let Some(cmd) = self.args.command.as_deref() {
-                        if let Some(info) = last_info.take() {
-                            let mut child = if let Some(mut child) = cur_child.take() {
-                                // check child still live?
-                                let child = if let Some(status) = child.try_wait()? {
-                                    // terminated
-                                    info!(
-                                        "Executing command again for exited status {:?} command process {}",
-                                        status.code(),
-                                        child.id()
-                                    );
-                                    self.spawn(cmd)?
-                                } else {
-                                    // alive
-                                    debug!(
-                                        "found running process {} for recv timeout {}",
-                                        child.id(),
-                                        timeout.as_secs()
-                                    );
-                                    child
-                                };
-                                child
-                            } else {
-                                self.spawn(cmd)?
-                            };
-
-                            // input to proc stdin
-                            trace!("Writing info `{info:?}` to be formatted to the stdin of process {}", child.id());
-                            self.format(&info, child.stdin.as_mut().unwrap())?;
-
-                            cur_child = Some(child);
-                        }
-
-                        last_info = None;
-                    }
-                }
-                Err(e) => bail!(e),
-            }
-        }
-    }
-
-    fn spawn(&self, cmd: &str) -> Result<Child> {
-        println!("starting new process `{cmd}`");
-        if self.args.tty {
-            let sh = "sh";
-            trace!("executing command `{cmd}` in tty {sh}");
-            make_script_command(cmd, Some(sh)).and_then(|mut c| c.stdin(Stdio::piped()).spawn())
-        } else {
-            let args =
-                shlex::split(cmd).ok_or_else(|| anyhow!("Unable to parse the command: {cmd}"))?;
-
-            trace!("executing command `{cmd}` with args: {args:?}");
-            let name = &args[0];
-            Command::new(name)
-                .args(&args[1..])
-                .stdin(Stdio::piped())
-                // .stdout(Stdio::piped())
-                // .stderr(Stdio::piped())
-                .spawn()
-        }
-        .map_err(Into::into)
-    }
-}
-
-struct MyWatcher<'a> {
-    args: &'a Args,
-    _watcher: Arc<Mutex<RecommendedWatcher>>,
-    rx: Receiver<EventInfo>,
-    exclude_globs: Option<GlobSet>,
-    include_globs: Option<GlobSet>,
-}
-
-impl<'a> MyWatcher<'a> {
-    pub fn new(args: &'a Args) -> Result<Self> {
-        let exclude_globs = args
-            .excludes
-            .as_deref()
-            .map(|globs| {
-                globs
-                    .iter()
-                    .map(|s| args.build_glob(s))
-                    .fold_ok(GlobSetBuilder::new(), |mut b, g| {
-                        b.add(g);
-                        b
-                    })
-                    .and_then(|b| b.build().map_err(Into::into))
-                    .map(Some)
-            })
-            .unwrap_or(Ok(None))?;
-
-        let include_globs = args
-            .includes
-            .as_deref()
-            .map(|globs| {
-                globs
-                    .iter()
-                    .map(|s| args.build_glob(s))
-                    .fold_ok(GlobSetBuilder::new(), |mut b, g| {
-                        b.add(g);
-                        b
-                    })
-                    .and_then(|b| b.build().map_err(Into::into))
-                    .map(Some)
-            })
-            .unwrap_or(Ok(None))?;
-
-        let channel_size = 1000;
-        let (tx, rx) = sync_channel(channel_size);
-        let mut watcher = notify::recommended_watcher(move |res: Result<Event, notify::Error>| {
+        let watcher = notify::recommended_watcher(move |res: Result<Event, notify::Error>| {
             match res {
                 Ok(e) => {
                     trace!(
@@ -472,37 +254,115 @@ impl<'a> MyWatcher<'a> {
             }
         })?;
 
-        // start watch paths
-        let rec_mod = if args.recurive {
+        Ok(Self {
+            rx,
+            watcher: Some(watcher),
+            event_filter: EventFilter::new(args)?,
+            timeout: args.poll_interval.into(),
+            paths: args.paths.clone(),
+            recurive: args.recurive,
+        })
+    }
+
+    pub fn iter(&self) -> Result<Iter> {
+        todo!()
+    }
+
+    fn start(&mut self) -> Result<&mut Self> {
+        let rec_mod = if self.recurive {
             RecursiveMode::Recursive
         } else {
             RecursiveMode::NonRecursive
         };
-        let paths = &args.paths;
+        let paths = &self.paths;
         for path in paths {
-            watcher.watch(path, rec_mod)?;
+            self.watcher.as_mut().unwrap().watch(path, rec_mod)?;
         }
 
         println!(
             "waiting {:?} events in interval {}s for {}{} paths: {:?}",
-            args.events,
-            args.poll_interval.as_secs(),
-            if args.recurive { "recurive " } else { "" },
+            self.event_filter.events,
+            self.timeout.as_secs(),
+            if self.recurive { "recurive " } else { "" },
             paths.len(),
             paths
         );
+        Ok(self)
+    }
 
+    fn wait_next(&self) -> Option<Option<EventInfo>> {
+        loop {
+            return match self.rx.recv_timeout(self.timeout) {
+                Ok(info) => {
+                    if self.event_filter.filter(&info) {
+                        Some(Some(info))
+                    } else {
+                        trace!("skipped received event {info:?}");
+                        continue;
+                    }
+                }
+                Err(RecvTimeoutError::Timeout) => Some(None),
+                Err(RecvTimeoutError::Disconnected) => {
+                    info!("close the iter for disconnected channel");
+                    None
+                }
+            };
+        }
+    }
+}
+
+pub struct Iter<'a> {
+    e: &'a EventWatcher,
+}
+
+impl<'a> Iterator for Iter<'a> {
+    type Item = Option<EventInfo>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.e.wait_next()
+    }
+}
+
+pub struct IntoIter {
+    e: EventWatcher,
+}
+
+impl Iterator for IntoIter {
+    type Item = Option<EventInfo>;
+    fn next(&mut self) -> Option<Self::Item> {
+        self.e.wait_next()
+    }
+}
+
+impl IntoIterator for EventWatcher {
+    type Item = Option<EventInfo>;
+
+    type IntoIter = IntoIter;
+
+    fn into_iter(self) -> Self::IntoIter {
+        IntoIter { e: self }
+    }
+}
+
+pub struct EventFilter {
+    events: Vec<EventType>,
+    exclude_globs: Option<GlobSet>,
+    include_globs: Option<GlobSet>,
+}
+
+impl EventFilter {
+    pub fn new(args: &Args) -> Result<Self> {
+        let exclude_globs = args.build_exclude_globs()?;
+        let include_globs = args.build_include_globs()?;
         Ok(Self {
-            args,
-            rx,
-            _watcher: Arc::new(Mutex::new(watcher)),
+            events: args.events.clone(),
             exclude_globs,
             include_globs,
         })
     }
 
-    fn is_interested(&self, info: &EventInfo) -> bool {
-        self.args.events.iter().any(|e| *e == info.event)
+    pub fn filter(&self, info: &EventInfo) -> bool {
+        self.events.iter().any(|e| *e == info.event)
             && self
                 .exclude_globs
                 .as_ref()
@@ -517,33 +377,10 @@ impl<'a> MyWatcher<'a> {
     }
 }
 
-impl<'a> Iterator for MyWatcher<'a> {
-    type Item = Option<EventInfo>;
-    fn next(&mut self) -> Option<Self::Item> {
-        loop {
-            return match self.rx.recv_timeout(self.args.poll_interval.into()) {
-                Ok(info) => {
-                    if self.is_interested(&info) {
-                        Some(Some(info))
-                    } else {
-                        trace!("skipped received event {info:?}");
-                        continue;
-                    }
-                }
-                Err(RecvTimeoutError::Timeout) => Some(None),
-                Err(RecvTimeoutError::Disconnected) => {
-                    warn!("found disconnected channel. close the iter");
-                    None
-                },
-            };
-        }
-    }
-}
-
-trait ProcessHandler {
+pub trait Handler {
     fn handle<I>(&self, events: I) -> Result<()>
     where
-        I: Iterator<Item = Option<EventInfo>>;
+        I: IntoIterator<Item = Option<EventInfo>>;
 
     fn format(&self, e: &EventInfo, writer: &mut impl Write) -> Result<()> {
         // TODO: format
@@ -551,22 +388,34 @@ trait ProcessHandler {
         writeln!(writer, "{} {}", e.event, path_str)?;
         Ok(())
     }
+}
 
-    fn spawn(&self, cmd: &str, tty: bool) -> Result<Child> {
-        println!("starting new process `{cmd}`");
-        if tty {
+pub trait ProcessHandler: Handler {
+    fn new(args: ProcessArgs) -> Self;
+
+    fn process_args(&self) -> &ProcessArgs;
+
+    fn spawn(&self) -> Result<Child> {
+        let args = self.process_args();
+        let cmd = &args.command;
+        println!("starting new process with args: `{args:?}`");
+        if args.tty {
             let sh = "sh";
             trace!("executing command `{cmd}` in tty {sh}");
             make_script_command(cmd, Some(sh)).and_then(|mut c| c.stdin(Stdio::piped()).spawn())
         } else {
-            let args =
+            let cmd_args =
                 shlex::split(cmd).ok_or_else(|| anyhow!("Unable to parse the command: {cmd}"))?;
 
-            trace!("executing command `{cmd}` with args: {args:?}");
-            let name = &args[0];
+            trace!("executing command `{cmd}` with args: {cmd_args:?}");
+            let name = &cmd_args[0];
             Command::new(name)
-                .args(&args[1..])
-                .stdin(Stdio::piped())
+                .args(&cmd_args[1..])
+                .stdin(if args.send_stdin {
+                    Stdio::piped()
+                } else {
+                    Stdio::inherit()
+                })
                 // .stdout(Stdio::piped())
                 // .stderr(Stdio::piped())
                 .spawn()
@@ -575,54 +424,82 @@ trait ProcessHandler {
     }
 }
 
-struct SingleProcessHandler {
-    args: Args,
-}
-
-impl ProcessHandler for SingleProcessHandler {
+struct SimpleHandler;
+impl Handler for SimpleHandler {
     fn handle<I>(&self, events: I) -> Result<()>
     where
-        I: Iterator<Item = Option<EventInfo>>,
+        I: IntoIterator<Item = Option<EventInfo>>,
+    {
+        for e in events.into_iter().flatten() {
+            self.format(&e, &mut io::stdout())?;
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug)]
+pub struct ProcessArgs {
+    tty: bool,
+    send_stdin: bool,
+    command: String,
+}
+
+pub struct SingleProcessHandler {
+    args: ProcessArgs,
+}
+
+impl Handler for SingleProcessHandler {
+    /// 单进程处理事件。
+    /// 开始的多个连续的事件将仅在None info出现后启动进程，后面的事件可能send_stdin=true发送给进程stdin。
+    /// 如果进程启动后退出，则会重新开始启动
+    fn handle<I>(&self, events: I) -> Result<()>
+    where
+        I: IntoIterator<Item = Option<EventInfo>>,
     {
         let mut cur_child = None::<Child>;
         let mut last_info = None::<EventInfo>;
-        let timeout: Duration = self.args.poll_interval.into();
 
         for e in events {
             if let Some(info) = e {
                 info!("found new event {} in path {:?}", info.event, info.paths);
-                if let Some(_cmd) = self.args.command.as_deref() {
-                    if let Some(child) = cur_child.as_mut() {
-                        // check child still live?
-                        if let Some(status) = child.try_wait()? {
-                            // terminated
-                            debug!(
-                                "cleaning exited status {:?} for process {}",
-                                status.code(),
-                                child.id()
+                if let Some(child) = cur_child.as_mut() {
+                    // check child still live?
+                    if let Some(status) = child.try_wait()? {
+                        if !status.success() {
+                            error!(
+                                "failed to run process {} with command `{}` exit code {}",
+                                child.id(),
+                                self.args.command,
+                                status.code().unwrap_or(-1)
                             );
+                        }
+                        // terminated
+                        debug!(
+                            "cleaning exited status {:?} for process {}",
+                            status.code(),
+                            child.id()
+                        );
 
-                            // rerun for next timeout
-                            cur_child.take();
-                        } else {
+                        // rerun for next timeout
+                        cur_child.take();
+                    } else {
+                        if self.args.send_stdin {
                             // alive
                             trace!("Writing info `{info:?}` to be formatted to the stdin of existing process {}", child.id());
                             // dont close stdin, only release lock to unblock
                             self.format(&info, child.stdin.as_mut().unwrap())?;
-
-                            last_info = None;
-                            continue;
                         }
+                        last_info = None;
+                        continue;
                     }
-
-                    last_info = Some(info);
-                } else {
-                    trace!("Writing info `{info:?}` to be formatted to the stdout");
-                    self.format(&info, &mut io::stdout())?;
                 }
-            } 
+
+                debug!("waiting event info {info:?} for next timeout");
+                last_info = Some(info);
+            }
             // timeout
-            else if let Some(cmd) = self.args.command.as_deref() {
+            else {
+                trace!("checking last info `{last_info:?}` for timeout");
                 if let Some(info) = last_info.take() {
                     let mut child = if let Some(mut child) = cur_child.take() {
                         // check child still live?
@@ -633,27 +510,25 @@ impl ProcessHandler for SingleProcessHandler {
                                 status.code(),
                                 child.id()
                             );
-                            self.spawn(cmd, self.args.tty)?
+                            self.spawn()?
                         } else {
                             // alive
-                            debug!(
-                                "found running process {} for recv timeout {}",
-                                child.id(),
-                                timeout.as_secs()
-                            );
+                            debug!("found running process {}", child.id(),);
                             child
                         };
                         child
                     } else {
-                        self.spawn(cmd, self.args.tty)?
+                        self.spawn()?
                     };
 
                     // input to proc stdin
-                    trace!(
-                        "Writing info `{info:?}` to be formatted to the stdin of process {}",
-                        child.id()
-                    );
-                    self.format(&info, child.stdin.as_mut().unwrap())?;
+                    if self.args.send_stdin {
+                        trace!(
+                            "Writing info `{info:?}` to be formatted to the stdin of process {}",
+                            child.id()
+                        );
+                        self.format(&info, child.stdin.as_mut().unwrap())?;
+                    }
 
                     cur_child = Some(child);
                 }
@@ -661,7 +536,18 @@ impl ProcessHandler for SingleProcessHandler {
                 last_info = None;
             }
         }
-        todo!()
+
+        bail!("events hang up")
+    }
+}
+
+impl ProcessHandler for SingleProcessHandler {
+    fn process_args(&self) -> &ProcessArgs {
+        &self.args
+    }
+
+    fn new(args: ProcessArgs) -> Self {
+        Self { args }
     }
 }
 
@@ -670,11 +556,7 @@ mod tests {
     use super::*;
     use log::LevelFilter;
     use rand::{distributions::Alphanumeric, Rng};
-    use std::{
-        env, fs,
-        path::Path,
-        sync::{mpsc::channel, Once},
-    };
+    use std::{env, fs, path::Path, sync::Once, thread};
     use tempfile::tempdir;
 
     static CRATE_NAME: &str = env!("CARGO_CRATE_NAME");
@@ -686,7 +568,7 @@ mod tests {
             env_logger::builder()
                 .is_test(true)
                 .filter_level(LevelFilter::Info)
-                .filter_module(CRATE_NAME, LevelFilter::Debug)
+                .filter_module(CRATE_NAME, LevelFilter::Trace)
                 .init();
         });
     }
@@ -700,87 +582,106 @@ mod tests {
         Ok(())
     }
 
+    fn rand_writes<P: AsRef<Path>>(paths: &[P]) -> Result<Vec<&P>> {
+        paths
+            .iter()
+            .map(|p| {
+                let path = p.as_ref();
+                if let Some(path) = path.parent() {
+                    fs::create_dir_all(path)?;
+                }
+                let s = rand::thread_rng()
+                    .sample_iter(&Alphanumeric)
+                    .take(10)
+                    .map(char::from)
+                    .collect::<String>();
+                trace!("writing {} for watching with content: {s}", path.display());
+                fs::write(path, s)?;
+                Ok(p)
+            })
+            .collect::<Result<Vec<_>>>()
+    }
+
     #[test]
-    fn test_interested() -> Result<()> {
+    fn test_watcher_iter() -> Result<()> {
         let dir = tempdir()?;
         env::set_current_dir(&dir)?;
-        let cur_path = Path::new(".");
+        let root = dir.path();
+        let args = Args::parse_from(format!("{CRATE_NAME} -r {}", root.display()).split(' '));
+        let mut watcher = EventWatcher::new(&args)?;
+        watcher.start()?;
+        let tmp_paths = ["a/b/c/c.txt", "a/b/b.txt", "a/a.txt"].map(|s| dir.path().join(s));
+        {
+            let watcher = watcher.watcher.take().unwrap();
+            let tmp_paths = tmp_paths.clone();
+            thread::spawn(move || {
+                let effect_paths = rand_writes(&tmp_paths)?;
+                assert_eq!(
+                    &tmp_paths,
+                    effect_paths
+                        .into_iter()
+                        .cloned()
+                        .collect::<Vec<_>>()
+                        .as_slice()
+                );
 
-        // a/a.txt
-        // a/b/b.txt
-        // a/b/c/c.txt
-        let mut tmp_paths = ["a/b/c/c.txt", "a/b/b.txt", "a/a.txt"].map(|s| dir.path().join(s));
-        tmp_paths.sort();
-        fs::create_dir_all(tmp_paths.last().and_then(|p| p.parent()).unwrap())?;
+                // waiting for receiver
+                thread::sleep(Duration::from_millis(1000));
+                // drop watcher and close iter
+                drop(watcher);
+                Ok::<_, anyhow::Error>(())
+            });
+        }
 
-        let (tx, rx) = channel();
-        let mut watcher = notify::recommended_watcher(tx)?;
-        trace!("watching recursive path {}", cur_path.display());
-        watcher.watch(cur_path, RecursiveMode::Recursive)?;
+        let events = watcher.into_iter().collect::<Vec<_>>();
+        info!("received {} events: {events:?}", events.len());
+        // at least create,modify events for per path. and create/access dir
+        assert!(tmp_paths.len() * 2 < events.len());
+        // events contains per path
+        assert!(tmp_paths.iter().all(|p| {
+            events
+                .iter()
+                .any(|e| e.as_ref().map_or(false, |e| e.paths.contains(p)))
+        }));
 
-        // write tmp paths
-        let rand_write = |path: &Path| {
-            let s = rand::thread_rng()
-                .sample_iter(&Alphanumeric)
-                .take(10)
-                .map(char::from)
-                .collect::<String>();
-            trace!("writing {} for watching with content: {s}", path.display());
-            fs::write(path, s)?;
-            Ok::<_, anyhow::Error>(())
+        Ok(())
+    }
+
+    #[test]
+    fn test_single_handler() -> Result<()> {
+        let events = [
+            // no event for timeout
+            None,
+            None,
+            // new event
+            Some(EventInfo {
+                event: EventType::Create,
+                paths: vec![PathBuf::from("a.txt")],
+            }),
+            Some(EventInfo {
+                event: EventType::Create,
+                paths: vec![PathBuf::from("b.txt")],
+            }),
+            // timeout
+            None,
+            None,
+            // new event
+            Some(EventInfo {
+                event: EventType::Create,
+                paths: vec![PathBuf::from("c.txt")],
+            }),
+        ];
+
+        let args = ProcessArgs {
+            command: "cat".to_string(),
+            send_stdin: true,
+            tty: false,
         };
-        for p in &tmp_paths {
-            rand_write(p)?;
-        }
-
-        let timeout = Duration::from_secs(1);
-        info!("waiting timeout {}s for watching", timeout.as_secs());
-
-        // get events for watch tmp paths
-        let mut events = vec![];
-        loop {
-            match rx.recv_timeout(timeout) {
-                Ok(e) => {
-                    trace!("received {e:?}");
-                    events.push(e?)
-                }
-                Err(e) => {
-                    debug!("break on received error: {e}");
-                    drop(watcher);
-                    break;
-                }
-            }
-        }
-
-        info!("found {} events", events.len());
-        // multi-events on one path. create,modify,access
-        assert!(events.len() > tmp_paths.len());
-        assert!(tmp_paths
-            .iter()
-            .all(|p| events.iter().any(|e| e.paths.contains(p))));
-
-        let event_paths = events
-            .iter()
-            .flat_map(|e| e.paths.iter())
-            .cloned()
-            .dedup()
-            .sorted()
-            .collect::<Vec<_>>();
-        assert_eq!(event_paths, tmp_paths);
-
-        // exclude last a/b/c/c.txt
-        let args =
-            Args::parse_from(format!("{CRATE_NAME} -E **/c/* {}", cur_path.display()).split(' '));
-
-        let cli = Cli::new(&args)?;
-        assert!(!cli.is_interested(&EventInfo {
-            event: EventType::Create,
-            paths: vec![tmp_paths.last().cloned().unwrap()],
-        }));
-        assert!(cli.is_interested(&EventInfo {
-            event: EventType::Create,
-            paths: vec![tmp_paths.first().cloned().unwrap()],
-        }));
+        let handler = SingleProcessHandler { args };
+        let res = handler.handle(events);
+        debug!("handler result: {res:?}");
+        assert!(res.is_err());
+        assert!(res.unwrap_err().to_string().contains("events hang up"));
         Ok(())
     }
 
@@ -801,13 +702,13 @@ mod tests {
             )],
         };
 
-        let cli = Cli::new(&args)?;
-        let globs = cli.include_globs.as_ref().unwrap();
+        let ef = EventFilter::new(&args)?;
+        let globs = ef.include_globs.as_ref().unwrap();
         assert!(!globs.is_match(&info.paths[0]));
         assert!(globs.is_match(&info2.paths[0]));
 
-        assert!(!cli.is_interested(&info));
-        assert!(cli.is_interested(&info2));
+        assert!(!ef.filter(&info));
+        assert!(ef.filter(&info2));
         Ok(())
     }
 
@@ -828,13 +729,13 @@ mod tests {
             )],
         };
 
-        let cli = Cli::new(&args)?;
-        let globs = cli.exclude_globs.as_ref().unwrap();
+        let ef = EventFilter::new(&args)?;
+        let globs = ef.exclude_globs.as_ref().unwrap();
         assert!(!globs.is_match(&info.paths[0]));
         assert!(globs.is_match(&info2.paths[0]));
 
-        assert!(cli.is_interested(&info));
-        assert!(!cli.is_interested(&info2));
+        assert!(ef.filter(&info));
+        assert!(!ef.filter(&info2));
 
         let pat = "**/avs/failed/**";
         let args = Args::parse_from(format!(r#"{CRATE_NAME} -E {pat} dot_xxx"#).split(' '));
@@ -844,10 +745,10 @@ mod tests {
                 "/home/xxx/.local/share/chezmoi/dot_xxx/avs/failed",
             )],
         };
-        let cli = Cli::new(&args)?;
-        let globs = cli.exclude_globs.as_ref().unwrap();
+        let ef = EventFilter::new(&args)?;
+        let globs = ef.exclude_globs.as_ref().unwrap();
         assert!(!globs.is_match(&info.paths[0]));
-        assert!(cli.is_interested(&info));
+        assert!(ef.filter(&info));
         Ok(())
     }
 }
