@@ -62,8 +62,8 @@ pub struct Args {
     #[arg(long = "generate", value_enum)]
     generator: Option<Shell>,
 
-    /// log level. default off
-    #[arg(short, long, action = clap::ArgAction::Count, default_value_t = 0)]
+    /// log level. default error
+    #[arg(short, long, action = clap::ArgAction::Count, default_value_t = 1)]
     verbose: u8,
 
     /// recursive for paths
@@ -497,22 +497,31 @@ impl Handler for SingleProcessHandler {
             // timeout
             else {
                 trace!("checking last info `{last_info:?}` for timeout");
-                if let Some(info) = last_info.take() {
-                    let mut child = if let Some(mut child) = cur_child.take() {
-                        // check child still live?
-                        let child = if let Some(status) = child.try_wait()? {
-                            // terminated
-                            info!(
-                                "Executing command again for exited status {:?} command process {}",
-                                status.code(),
-                                child.id()
+                cur_child = if let Some(mut child) = cur_child.take() {
+                    if let Some(status) = child.try_wait()? {
+                        // terminated
+                        trace!(
+                            "found exited process {} with status: {:?}",
+                            child.id(),
+                            status.code(),
+                        );
+                        if !status.success() {
+                            error!(
+                                "failed to run command `{}` with status {}",
+                                self.args.command,
+                                status.code().unwrap_or_default()
                             );
-                            self.spawn()?
-                        } else {
-                            // alive
-                            debug!("found running process {}", child.id(),);
-                            child
-                        };
+                        }
+                        None
+                    } else {
+                        Some(child)
+                    }
+                } else {
+                    None
+                };
+
+                if let Some(info) = last_info.take() {
+                    let mut child = if let Some(child) = cur_child.take() {
                         child
                     } else {
                         self.spawn()?
@@ -553,7 +562,12 @@ mod tests {
     use super::*;
     use log::LevelFilter;
     use rand::{distributions::Alphanumeric, Rng};
-    use std::{env, fs, path::Path, sync::Once, thread};
+    use std::{
+        env, fs,
+        path::Path,
+        sync::{mpsc::SendError, Once},
+        thread::{self, sleep},
+    };
     use tempfile::tempdir;
 
     static CRATE_NAME: &str = env!("CARGO_CRATE_NAME");
@@ -649,7 +663,6 @@ mod tests {
         let events = [
             // no event for timeout
             None,
-            None,
             // new event
             Some(EventInfo {
                 event: EventType::Create,
@@ -667,15 +680,32 @@ mod tests {
                 event: EventType::Create,
                 paths: vec![PathBuf::from("c.txt")],
             }),
+            None,
+            Some(EventInfo {
+                event: EventType::Create,
+                paths: vec![PathBuf::from("d.txt")],
+            }),
+            None,
         ];
 
+        let (tx, rx) = sync_channel(1);
+        let dur = Duration::from_millis(500);
+        thread::spawn(move || {
+            for e in events {
+                info!("sending event {e:?}");
+                tx.send(e)?;
+                sleep(dur);
+            }
+            Ok::<_, SendError<_>>(())
+        });
+
         let args = ProcessArgs {
-            command: "cat".to_string(),
+            command: "false".to_string(),
             send_stdin: true,
             tty: false,
         };
         let handler = SingleProcessHandler { args };
-        let res = handler.handle(events);
+        let res = handler.handle(rx);
         debug!("handler result: {res:?}");
         assert!(res.is_err());
         assert!(res.unwrap_err().to_string().contains("events hang up"));
