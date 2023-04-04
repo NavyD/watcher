@@ -496,7 +496,13 @@ impl Handler for SingleProcessHandler {
             }
             // timeout
             else {
-                trace!("checking last info `{last_info:?}` for timeout");
+                trace!(
+                    "checking timeout last info `{last_info:?}` for child process {}",
+                    cur_child
+                        .as_ref()
+                        .map(|c| c.id().to_string())
+                        .unwrap_or_else(|| "none".to_string())
+                );
                 cur_child = if let Some(mut child) = cur_child.take() {
                     if let Some(status) = child.try_wait()? {
                         // terminated
