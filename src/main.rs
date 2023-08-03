@@ -118,6 +118,7 @@ impl Args {
             .filter_level(log::LevelFilter::Error)
             .filter_module(module_path!(), level)
             .init();
+        trace!("Init with args: {self:?}");
         Ok(())
     }
 
